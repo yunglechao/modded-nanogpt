@@ -923,7 +923,9 @@ class AttnArgs:
     attn_gate_w: torch.Tensor
     ve_gate_w: torch.Tensor
 
-flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+_cap = torch.cuda.get_device_capability()
+_flash_name = 'varunneal/flash-attention-3' if _cap[0] >= 9 else 'varunneal/flash-attention-2'
+flash_attn_interface = get_kernel(_flash_name).flash_attn_interface
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int):
