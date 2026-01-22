@@ -924,8 +924,58 @@ class AttnArgs:
     ve_gate_w: torch.Tensor
 
 _cap = torch.cuda.get_device_capability()
-_flash_name = 'varunneal/flash-attention-3' if _cap[0] >= 9 else 'varunneal/flash-attention-2'
-flash_attn_interface = get_kernel(_flash_name).flash_attn_interface
+flash_attn_interface = None
+if _cap[0] >= 9:
+    flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+else:
+    try:
+        from flash_attn import flash_attn_varlen_func as _fa2_varlen
+        class _FA2Wrapper:
+            def flash_attn_varlen_func(self, q, k, v, cu_seqlens_q, cu_seqlens_k,
+                                       max_seqlen_q, max_seqlen_k, causal, softmax_scale, window_size):
+                kwargs = {}
+                if softmax_scale is not None:
+                    kwargs["softmax_scale"] = softmax_scale
+                try:
+                    return _fa2_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                                       max_seqlen_q, max_seqlen_k,
+                                       causal=causal, window_size=window_size, **kwargs)
+                except TypeError:
+                    return _fa2_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                                       max_seqlen_q, max_seqlen_k,
+                                       causal=causal, **kwargs)
+        flash_attn_interface = _FA2Wrapper()
+    except Exception:
+        flash_attn_interface = None
+
+@dynamo.disable
+def _sdpa_varlen(q, k, v, cu_seqlens, softmax_scale, window_size):
+    # Fallback for non-Hopper GPUs: per-doc SDPA over varlen packed sequences.
+    # q/k/v: (T, H, D), cu_seqlens: int32 cumulative lengths.
+    T, H, D = q.shape
+    out = torch.empty_like(q)
+    cu = cu_seqlens.detach().cpu().tolist()
+    if cu:
+        cu[-1] = min(cu[-1], T)
+    for i in range(len(cu) - 1):
+        start, end = cu[i], cu[i + 1]
+        if end <= start:
+            continue
+        q_i = q[start:end].transpose(0, 1).unsqueeze(0)
+        k_i = k[start:end].transpose(0, 1).unsqueeze(0)
+        v_i = v[start:end].transpose(0, 1).unsqueeze(0)
+        if softmax_scale is not None:
+            q_i = q_i * softmax_scale
+        if window_size is not None and window_size > 0:
+            L = end - start
+            idx = torch.arange(L, device=q.device)
+            dist = idx[:, None] - idx[None, :]
+            mask = (dist >= 0) & (dist < window_size)
+            y_i = F.scaled_dot_product_attention(q_i, k_i, v_i, attn_mask=mask, is_causal=False)
+        else:
+            y_i = F.scaled_dot_product_attention(q_i, k_i, v_i, is_causal=True)
+        out[start:end] = y_i.squeeze(0).transpose(0, 1)
+    return out
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int):
@@ -962,9 +1012,12 @@ class CausalSelfAttention(nn.Module):
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
         # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                        max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                        causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
+        if flash_attn_interface is not None:
+            y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+                                                            max_seqlen_q=max_len, max_seqlen_k=max_len,
+                                                            causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
+        else:
+            y = _sdpa_varlen(q[0], k[0], v[0], seqlens, yarn.attn_scale, bm_size)
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
@@ -1019,9 +1072,12 @@ class PairedHeadCausalSelfAttention(nn.Module):
         seqlens = 2 * seqlens
         max_len = 2 * max_len
 
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                        max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                        causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
+        if flash_attn_interface is not None:
+            y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+                                                            max_seqlen_q=max_len, max_seqlen_k=max_len,
+                                                            causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
+        else:
+            y = _sdpa_varlen(q[0], k[0], v[0], seqlens, yarn.attn_scale, bm_size)
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
